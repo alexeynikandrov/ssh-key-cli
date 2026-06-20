@@ -1,0 +1,14 @@
+{
+  "rfcs": [
+    {
+      "number": "0001",
+      "title": "RFC-0001: общая идея",
+      "status": "implemented",
+      "dependencies": [],
+      "superseded_by": null,
+      "links": [],
+      "mtime": "1781772993",
+      "content_hash": "6ed620c8c156ba8512503685ee41b964c12b23148c981255f453d571ff0eba4f"
+    }
+  ]
+}

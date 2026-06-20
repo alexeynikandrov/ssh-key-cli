@@ -1,0 +1,14 @@
+services:
+  e2e:
+    image: rust:1.90-bookworm
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    command:
+      [
+        "/usr/local/cargo/bin/cargo",
+        "test",
+        "--all-targets",
+        "--all-features",
+        "e2e::tests::",
+      ]
