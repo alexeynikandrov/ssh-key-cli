@@ -1,4 +1,4 @@
-% SSH-KEY-SYNC(1) ssh-key-sync 0.1.11
+% SSH-KEY-SYNC(1) ssh-key-sync 0.1.13
 % ssh-key-sync maintainers
 % June 2026
 
@@ -27,7 +27,9 @@ The tool updates only the managed block in `authorized_keys`:
 
 **start**
 : Start daemon mode. By default, starts in background and writes logs to
-  `/tmp/ssh-key-sync-<sid>.log`.
+  runtime directory:
+  `${XDG_RUNTIME_DIR}/ssh-key-sync/<sid>/daemon.log`
+  (fallback: `~/.local/run/ssh-key-sync/<sid>/daemon.log`).
 
 **stop**
 : Stop background daemon for the given `SID`.
@@ -95,14 +97,17 @@ For `stop` and `status`:
 
 # FILES
 
-`/tmp/ssh-key-sync-<sid>.pid`
+`${XDG_RUNTIME_DIR}/ssh-key-sync/<sid>/daemon.pid`
 : PID file for running daemon.
 
-`/tmp/ssh-key-sync-<sid>.stop`
+`${XDG_RUNTIME_DIR}/ssh-key-sync/<sid>/daemon.stop`
 : Stop request file used by `stop`.
 
-`/tmp/ssh-key-sync-<sid>.log`
+`${XDG_RUNTIME_DIR}/ssh-key-sync/<sid>/daemon.log`
 : Background daemon log file.
+
+If `XDG_RUNTIME_DIR` is not set, the same files are stored under:
+`~/.local/run/ssh-key-sync/<sid>/`.
 
 # EXAMPLES
 

@@ -4,10 +4,12 @@ use crate::discovery::{DiscoveryEngine, DiscoveryEvent};
 use crate::ssh_keys::read_local_public_key;
 use crate::transport::{HttpKeyExchangeService, PATH_GET_PUBLIC_KEY, PATH_PUBLISH_PARTICIPANT};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,6 +20,10 @@ const LOOP_SLEEP_MILLIS: u64 = 200;
 const IO_TIMEOUT_SECS: u64 = 3;
 const STOP_WAIT_MILLIS: u64 = 3_000;
 const STOP_POLL_MILLIS: u64 = 50;
+const CONTROL_ROOT_DIR: &str = "ssh-key-sync";
+const PID_FILE_NAME: &str = "daemon.pid";
+const STOP_FILE_NAME: &str = "daemon.stop";
+const LOG_FILE_NAME: &str = "daemon.log";
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -31,6 +37,8 @@ pub enum RuntimeError {
     VerifyOrParseResponse,
     WriteAuthorizedKeys(String),
     ControlFile(String),
+    RuntimeDirectory(String),
+    MissingHomeDir,
     KillProcess(u32),
 }
 
@@ -51,6 +59,13 @@ impl std::fmt::Display for RuntimeError {
                 write!(f, "Failed to write authorized_keys at {path}")
             }
             RuntimeError::ControlFile(path) => write!(f, "Failed to access control file at {path}"),
+            RuntimeError::RuntimeDirectory(path) => {
+                write!(f, "Failed to prepare runtime directory at {path}")
+            }
+            RuntimeError::MissingHomeDir => write!(
+                f,
+                "Cannot resolve runtime directory: set XDG_RUNTIME_DIR or HOME"
+            ),
             RuntimeError::KillProcess(pid) => {
                 write!(f, "Failed to terminate process with pid {pid}")
             }
@@ -116,14 +131,15 @@ pub fn run_daemon(config: &AppConfig) -> Result<(), RuntimeError> {
 
     let mut managed_keys: HashMap<String, String> = HashMap::new();
     let mut next_sync_at = now_secs();
-    let pid_path = pid_file_path(&config.sid);
-    let stop_path = stop_file_path(&config.sid);
+    let control_dir = ensure_control_runtime_dir_for_sid(&config.sid)?;
+    let pid_path = control_dir.join(PID_FILE_NAME);
+    let stop_path = control_dir.join(STOP_FILE_NAME);
 
-    if Path::new(&stop_path).exists() {
-        fs::remove_file(&stop_path).map_err(|_| RuntimeError::ControlFile(stop_path.clone()))?;
+    if stop_path.exists() {
+        fs::remove_file(&stop_path)
+            .map_err(|_| RuntimeError::ControlFile(path_display(&stop_path)))?;
     }
-    fs::write(&pid_path, std::process::id().to_string())
-        .map_err(|_| RuntimeError::ControlFile(pid_path.clone()))?;
+    write_control_file(&pid_path, &std::process::id().to_string())?;
 
     println!(
         "Daemon is running. HTTP: {}, UDP: {}, participant: {}",
@@ -169,17 +185,17 @@ pub fn run_daemon(config: &AppConfig) -> Result<(), RuntimeError> {
             next_sync_at = now + config.sync_interval_secs.max(1);
         }
 
-        if Path::new(&stop_path).exists() {
+        if stop_path.exists() {
             println!("Stop requested, shutting down daemon");
             break;
         }
         thread::sleep(Duration::from_millis(LOOP_SLEEP_MILLIS));
     }
 
-    if Path::new(&pid_path).exists() {
+    if pid_path.exists() {
         let _ = fs::remove_file(&pid_path);
     }
-    if Path::new(&stop_path).exists() {
+    if stop_path.exists() {
         let _ = fs::remove_file(&stop_path);
     }
     Ok(())
@@ -218,10 +234,11 @@ pub fn run_single_sync(config: &AppConfig) -> Result<(), RuntimeError> {
 }
 
 pub fn stop_daemon(sid: &str) -> Result<bool, RuntimeError> {
-    match status_daemon(sid) {
+    match status_daemon(sid)? {
         DaemonStatus::Running { pid } => {
-            let path = stop_file_path(sid);
-            fs::write(&path, "stop").map_err(|_| RuntimeError::ControlFile(path.clone()))?;
+            ensure_control_runtime_dir_for_sid(sid)?;
+            let path = stop_file_path(sid)?;
+            write_control_file(&path, "stop")?;
 
             let mut waited = 0_u64;
             while process_exists(pid) && waited < STOP_WAIT_MILLIS {
@@ -242,13 +259,15 @@ pub fn stop_daemon(sid: &str) -> Result<bool, RuntimeError> {
             Ok(true)
         }
         DaemonStatus::StalePidFile { .. } => {
-            let pid_path = pid_file_path(sid);
-            if Path::new(&pid_path).exists() {
-                fs::remove_file(&pid_path).map_err(|_| RuntimeError::ControlFile(pid_path))?;
+            let pid_path = pid_file_path(sid)?;
+            if pid_path.exists() {
+                fs::remove_file(&pid_path)
+                    .map_err(|_| RuntimeError::ControlFile(path_display(&pid_path)))?;
             }
-            let stop_path = stop_file_path(sid);
-            if Path::new(&stop_path).exists() {
-                fs::remove_file(&stop_path).map_err(|_| RuntimeError::ControlFile(stop_path))?;
+            let stop_path = stop_file_path(sid)?;
+            if stop_path.exists() {
+                fs::remove_file(&stop_path)
+                    .map_err(|_| RuntimeError::ControlFile(path_display(&stop_path)))?;
             }
             Ok(false)
         }
@@ -256,24 +275,21 @@ pub fn stop_daemon(sid: &str) -> Result<bool, RuntimeError> {
     }
 }
 
-pub fn status_daemon(sid: &str) -> DaemonStatus {
-    let pid_path = pid_file_path(sid);
-    let path = Path::new(&pid_path);
-    if !path.exists() {
-        return DaemonStatus::Stopped;
+pub fn status_daemon(sid: &str) -> Result<DaemonStatus, RuntimeError> {
+    let pid_path = pid_file_path(sid)?;
+    if !pid_path.exists() {
+        return Ok(DaemonStatus::Stopped);
     }
-    let content = match fs::read_to_string(path) {
-        Ok(value) => value,
-        Err(_) => return DaemonStatus::Stopped,
-    };
-    let pid = match content.trim().parse::<u32>() {
-        Ok(value) => value,
-        Err(_) => return DaemonStatus::Stopped,
-    };
+    let content = fs::read_to_string(&pid_path)
+        .map_err(|_| RuntimeError::ControlFile(path_display(&pid_path)))?;
+    let pid = content
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| RuntimeError::ControlFile(path_display(&pid_path)))?;
     if process_exists(pid) {
-        DaemonStatus::Running { pid }
+        Ok(DaemonStatus::Running { pid })
     } else {
-        DaemonStatus::StalePidFile { pid }
+        Ok(DaemonStatus::StalePidFile { pid })
     }
 }
 
@@ -768,12 +784,120 @@ fn decode_nibble(value: u8) -> Option<u8> {
     }
 }
 
-fn pid_file_path(sid: &str) -> String {
-    format!("/tmp/ssh-key-sync-{}.pid", sanitize_for_file(sid))
+pub fn open_daemon_log_file(sid: &str) -> Result<(File, String), RuntimeError> {
+    ensure_control_runtime_dir_for_sid(sid)?;
+    let path = log_file_path(sid)?;
+    let file = open_control_file_append(&path)?;
+    Ok((file, path_display(&path)))
 }
 
-fn stop_file_path(sid: &str) -> String {
-    format!("/tmp/ssh-key-sync-{}.stop", sanitize_for_file(sid))
+pub fn daemon_log_file_path(sid: &str) -> Result<String, RuntimeError> {
+    Ok(path_display(&log_file_path(sid)?))
+}
+
+fn control_runtime_dir_with_env(
+    sid: &str,
+    xdg_runtime_dir: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf, RuntimeError> {
+    let sid_dir = sanitize_for_file(sid);
+    if let Some(path) = xdg_runtime_dir
+        && !path.trim().is_empty()
+    {
+        return Ok(PathBuf::from(path).join(CONTROL_ROOT_DIR).join(sid_dir));
+    }
+    if let Some(path) = home
+        && !path.trim().is_empty()
+    {
+        return Ok(PathBuf::from(path)
+            .join(".local")
+            .join("run")
+            .join(CONTROL_ROOT_DIR)
+            .join(sid_dir));
+    }
+    Err(RuntimeError::MissingHomeDir)
+}
+
+fn control_runtime_dir_path_for_sid(sid: &str) -> Result<PathBuf, RuntimeError> {
+    let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+    let home = std::env::var("HOME").ok();
+    control_runtime_dir_with_env(sid, xdg_runtime_dir.as_deref(), home.as_deref())
+}
+
+fn ensure_control_runtime_dir_for_sid(sid: &str) -> Result<PathBuf, RuntimeError> {
+    let sid_dir = control_runtime_dir_path_for_sid(sid)?;
+    let base_dir = sid_dir
+        .parent()
+        .ok_or_else(|| RuntimeError::RuntimeDirectory(path_display(&sid_dir)))?;
+    ensure_private_dir(base_dir)?;
+    ensure_private_dir(&sid_dir)?;
+    Ok(sid_dir)
+}
+
+fn pid_file_path(sid: &str) -> Result<PathBuf, RuntimeError> {
+    Ok(control_runtime_dir_path_for_sid(sid)?.join(PID_FILE_NAME))
+}
+
+fn stop_file_path(sid: &str) -> Result<PathBuf, RuntimeError> {
+    Ok(control_runtime_dir_path_for_sid(sid)?.join(STOP_FILE_NAME))
+}
+
+fn log_file_path(sid: &str) -> Result<PathBuf, RuntimeError> {
+    Ok(control_runtime_dir_path_for_sid(sid)?.join(LOG_FILE_NAME))
+}
+
+fn ensure_private_dir(path: &Path) -> Result<(), RuntimeError> {
+    fs::create_dir_all(path).map_err(|_| RuntimeError::RuntimeDirectory(path_display(path)))?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|_| RuntimeError::RuntimeDirectory(path_display(path)))?;
+    }
+    Ok(())
+}
+
+fn open_control_file_append(path: &Path) -> Result<File, RuntimeError> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true).write(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| RuntimeError::ControlFile(path_display(path)))?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| RuntimeError::ControlFile(path_display(path)))?;
+    }
+    Ok(file)
+}
+
+fn write_control_file(path: &Path, content: &str) -> Result<(), RuntimeError> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| RuntimeError::ControlFile(path_display(path)))?;
+    file.write_all(content.as_bytes())
+        .map_err(|_| RuntimeError::ControlFile(path_display(path)))?;
+    file.sync_all()
+        .map_err(|_| RuntimeError::ControlFile(path_display(path)))?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| RuntimeError::ControlFile(path_display(path)))?;
+    }
+    Ok(())
+}
+
+fn path_display(path: &Path) -> String {
+    path.to_string_lossy().to_string()
 }
 
 fn sanitize_for_file(value: &str) -> String {
@@ -791,4 +915,78 @@ fn sanitize_for_file(value: &str) -> String {
 
 fn process_exists(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        control_runtime_dir_with_env, ensure_private_dir, open_control_file_append,
+        write_control_file,
+    };
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn runtime_dir_uses_xdg_when_present() {
+        let dir = control_runtime_dir_with_env("group-a", Some("/run/user/1000"), Some("/home/a"))
+            .expect("runtime dir should resolve");
+        assert_eq!(dir, PathBuf::from("/run/user/1000/ssh-key-sync/group-a"));
+    }
+
+    #[test]
+    fn runtime_dir_falls_back_to_home_local_run() {
+        let dir = control_runtime_dir_with_env("group-a", None, Some("/home/a"))
+            .expect("runtime dir should resolve");
+        assert_eq!(
+            dir,
+            PathBuf::from("/home/a/.local/run/ssh-key-sync/group-a")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn control_dir_and_files_have_private_permissions() {
+        let base = unique_temp_path("runtime-perms");
+        let control_dir = base.join("ssh-key-sync").join("group-a");
+        ensure_private_dir(&control_dir).expect("control dir should be created");
+
+        let pid_path = control_dir.join("daemon.pid");
+        write_control_file(&pid_path, "123").expect("pid should be written");
+
+        let log_path = control_dir.join("daemon.log");
+        let _ = open_control_file_append(&log_path).expect("log should be opened");
+
+        let dir_mode = fs::metadata(&control_dir)
+            .expect("metadata should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        let pid_mode = fs::metadata(&pid_path)
+            .expect("metadata should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        let log_mode = fs::metadata(&log_path)
+            .expect("metadata should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(pid_mode, 0o600);
+        assert_eq!(log_mode, 0o600);
+
+        fs::remove_dir_all(base).expect("temp files should be removed");
+    }
+
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ssh-key-sync-{prefix}-{now}"))
+    }
 }

@@ -7,8 +7,18 @@
       "dependencies": [],
       "superseded_by": null,
       "links": [],
-      "mtime": "1781772993",
+      "mtime": "1782102413",
       "content_hash": "6ed620c8c156ba8512503685ee41b964c12b23148c981255f453d571ff0eba4f"
+    },
+    {
+      "number": "0002",
+      "title": "RFC-0002: План устранения слабых мест",
+      "status": "draft",
+      "dependencies": [],
+      "superseded_by": null,
+      "links": [],
+      "mtime": "1782102648",
+      "content_hash": null
     }
   ]
 }
