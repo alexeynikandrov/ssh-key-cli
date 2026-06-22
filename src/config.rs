@@ -20,6 +20,11 @@ pub struct AppConfig {
     pub sync_interval_secs: u64,
     pub public_key_path: String,
     pub authorized_keys_path: String,
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
+    pub tls_ca_path: Option<String>,
+    pub tls_server_name: Option<String>,
+    pub insecure_no_tls: bool,
     pub dry_run: bool,
 }
 
@@ -35,6 +40,11 @@ impl Debug for AppConfig {
             .field("sync_interval_secs", &self.sync_interval_secs)
             .field("public_key_path", &self.public_key_path)
             .field("authorized_keys_path", &self.authorized_keys_path)
+            .field("tls_cert_path", &self.tls_cert_path)
+            .field("tls_key_path", &self.tls_key_path)
+            .field("tls_ca_path", &self.tls_ca_path)
+            .field("tls_server_name", &self.tls_server_name)
+            .field("insecure_no_tls", &self.insecure_no_tls)
             .field("dry_run", &self.dry_run)
             .finish()
     }
@@ -57,6 +67,11 @@ pub struct ConfigInput<'a> {
     pub sync_interval_secs: Option<u64>,
     pub public_key_path: Option<&'a str>,
     pub authorized_keys_path: Option<&'a str>,
+    pub tls_cert_path: Option<&'a str>,
+    pub tls_key_path: Option<&'a str>,
+    pub tls_ca_path: Option<&'a str>,
+    pub tls_server_name: Option<&'a str>,
+    pub insecure_no_tls: bool,
     pub dry_run: bool,
     pub config_path: Option<&'a str>,
 }
@@ -196,6 +211,41 @@ fn load_config_with_sources(
         &file_data,
         "DRY_RUN",
     );
+    let tls_cert_path = resolve_string(
+        input.tls_cert_path,
+        "SSH_KEY_SYNC_TLS_CERT_PATH",
+        env_data,
+        &file_data,
+        "TLS_CERT_PATH",
+    );
+    let tls_key_path = resolve_string(
+        input.tls_key_path,
+        "SSH_KEY_SYNC_TLS_KEY_PATH",
+        env_data,
+        &file_data,
+        "TLS_KEY_PATH",
+    );
+    let tls_ca_path = resolve_string(
+        input.tls_ca_path,
+        "SSH_KEY_SYNC_TLS_CA_PATH",
+        env_data,
+        &file_data,
+        "TLS_CA_PATH",
+    );
+    let tls_server_name = resolve_string(
+        input.tls_server_name,
+        "SSH_KEY_SYNC_TLS_SERVER_NAME",
+        env_data,
+        &file_data,
+        "TLS_SERVER_NAME",
+    );
+    let insecure_no_tls = resolve_bool(
+        input.insecure_no_tls,
+        "SSH_KEY_SYNC_INSECURE_NO_TLS",
+        env_data,
+        &file_data,
+        "INSECURE_NO_TLS",
+    );
 
     Ok(Some(AppConfig {
         sid,
@@ -207,6 +257,11 @@ fn load_config_with_sources(
         sync_interval_secs,
         public_key_path,
         authorized_keys_path,
+        tls_cert_path,
+        tls_key_path,
+        tls_ca_path,
+        tls_server_name,
+        insecure_no_tls,
         dry_run,
     }))
 }
@@ -222,6 +277,11 @@ fn collect_env() -> HashMap<String, String> {
         "SSH_KEY_SYNC_SYNC_INTERVAL_SECS",
         "SSH_KEY_SYNC_PUBLIC_KEY_PATH",
         "SSH_KEY_SYNC_AUTHORIZED_KEYS_PATH",
+        "SSH_KEY_SYNC_TLS_CERT_PATH",
+        "SSH_KEY_SYNC_TLS_KEY_PATH",
+        "SSH_KEY_SYNC_TLS_CA_PATH",
+        "SSH_KEY_SYNC_TLS_SERVER_NAME",
+        "SSH_KEY_SYNC_INSECURE_NO_TLS",
         "SSH_KEY_SYNC_DRY_RUN",
         "HOSTNAME",
     ];
@@ -357,6 +417,11 @@ mod tests {
             sync_interval_secs: None,
             public_key_path: None,
             authorized_keys_path: None,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_path: None,
+            tls_server_name: None,
+            insecure_no_tls: false,
             dry_run: false,
             config_path: None,
         }
@@ -454,6 +519,11 @@ mod tests {
              SYNC_INTERVAL_SECS=45\n\
              PUBLIC_KEY_PATH=/tmp/key.pub\n\
              AUTHORIZED_KEYS_PATH=/tmp/authorized_keys\n\
+             TLS_CERT_PATH=/tmp/tls.crt\n\
+             TLS_KEY_PATH=/tmp/tls.key\n\
+             TLS_CA_PATH=/tmp/ca.crt\n\
+             TLS_SERVER_NAME=node-a.local\n\
+             INSECURE_NO_TLS=false\n\
              DRY_RUN=true\n",
         );
 
@@ -477,6 +547,11 @@ mod tests {
         assert_eq!(config.sync_interval_secs, 45);
         assert_eq!(config.public_key_path, "/tmp/key.pub");
         assert_eq!(config.authorized_keys_path, "/tmp/authorized_keys");
+        assert_eq!(config.tls_cert_path, Some("/tmp/tls.crt".to_owned()));
+        assert_eq!(config.tls_key_path, Some("/tmp/tls.key".to_owned()));
+        assert_eq!(config.tls_ca_path, Some("/tmp/ca.crt".to_owned()));
+        assert_eq!(config.tls_server_name, Some("node-a.local".to_owned()));
+        assert!(!config.insecure_no_tls);
         assert!(config.dry_run);
 
         fs::remove_file(config_path).expect("temp config should be removed");
@@ -545,6 +620,26 @@ mod tests {
                 "SSH_KEY_SYNC_SYNC_INTERVAL_SECS".to_owned(),
                 "75".to_owned(),
             ),
+            (
+                "SSH_KEY_SYNC_TLS_CERT_PATH".to_owned(),
+                "/env/tls.crt".to_owned(),
+            ),
+            (
+                "SSH_KEY_SYNC_TLS_KEY_PATH".to_owned(),
+                "/env/tls.key".to_owned(),
+            ),
+            (
+                "SSH_KEY_SYNC_TLS_CA_PATH".to_owned(),
+                "/env/ca.crt".to_owned(),
+            ),
+            (
+                "SSH_KEY_SYNC_TLS_SERVER_NAME".to_owned(),
+                "peer.env.local".to_owned(),
+            ),
+            (
+                "SSH_KEY_SYNC_INSECURE_NO_TLS".to_owned(),
+                "false".to_owned(),
+            ),
             ("SSH_KEY_SYNC_DRY_RUN".to_owned(), "true".to_owned()),
         ]);
 
@@ -560,6 +655,11 @@ mod tests {
             vec!["peer-a:1".to_owned(), "peer-b:2".to_owned()]
         );
         assert_eq!(config.sync_interval_secs, 75);
+        assert_eq!(config.tls_cert_path, Some("/env/tls.crt".to_owned()));
+        assert_eq!(config.tls_key_path, Some("/env/tls.key".to_owned()));
+        assert_eq!(config.tls_ca_path, Some("/env/ca.crt".to_owned()));
+        assert_eq!(config.tls_server_name, Some("peer.env.local".to_owned()));
+        assert!(!config.insecure_no_tls);
         assert!(config.dry_run);
     }
 

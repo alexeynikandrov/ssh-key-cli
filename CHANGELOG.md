@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.17] - 2026-06-22
+
+### Added
+- Added phase plan `docs/PLAN-2-3.md` for protected transport rollout.
+- Added TLS configuration fields and CLI options:
+  `--tls-cert-path`, `--tls-key-path`, `--tls-ca-path`, `--tls-server-name`,
+  and `--insecure-no-tls`.
+- Added README sections with full environment variable reference and
+  `--config-path` usage examples.
+- Added README runbook for generating local CA/node certificates and TLS launch examples.
+
+### Changed
+- Enabled TLS transport by default for runtime request/response paths with certificate loading
+  and CA-based peer verification.
+- Added explicit insecure fallback mode (`--insecure-no-tls`) with runtime warning for dev/test.
+- Updated `docs/man.md` with TLS options and TLS-aware examples.
+
 ## [0.1.16] - 2026-06-22
 
 ### Added

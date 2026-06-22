@@ -1,4 +1,4 @@
-% SSH-KEY-SYNC(1) ssh-key-sync 0.1.16
+% SSH-KEY-SYNC(1) ssh-key-sync 0.1.17
 % ssh-key-sync maintainers
 % June 2026
 
@@ -50,6 +50,11 @@ For `start` and `sync`:
 
 - `--sid` (or `SSH_KEY_SYNC_SID`)
 - `--sid-token` (or `SSH_KEY_SYNC_SID_TOKEN`)
+- `--tls-cert-path`
+- `--tls-key-path`
+- `--tls-ca-path`
+
+unless `--insecure-no-tls` is explicitly set.
 
 For `stop` and `status`: `--sid` is optional.
 
@@ -88,6 +93,21 @@ For `stop` and `status`: `--sid` is optional.
 : Path to authorized_keys file.
   Default: `~/.ssh/authorized_keys`.
 
+**--tls-cert-path** *PATH*
+: Path to TLS certificate in PEM format.
+
+**--tls-key-path** *PATH*
+: Path to TLS private key in PEM format.
+
+**--tls-ca-path** *PATH*
+: Path to trusted CA bundle in PEM format.
+
+**--tls-server-name** *NAME*
+: Optional server name override for outbound certificate validation.
+
+**--insecure-no-tls**
+: Disable TLS encryption and certificate verification (dev/test only).
+
 **--dry-run**
 : Run without writing `authorized_keys`.
 
@@ -116,7 +136,12 @@ If `XDG_RUNTIME_DIR` is not set, the same files are stored under:
 Start daemon in background:
 
 ```
-ssh-key-sync start --sid group-a --sid-token token-a
+ssh-key-sync start \
+  --sid group-a \
+  --sid-token token-a \
+  --tls-cert-path ./certs/node-a.crt \
+  --tls-key-path ./certs/node-a.key \
+  --tls-ca-path ./certs/ca.crt
 ```
 
 Check status and stop:
@@ -129,7 +154,12 @@ ssh-key-sync stop
 Run one-shot sync:
 
 ```
-ssh-key-sync sync --sid group-a --sid-token token-a
+ssh-key-sync sync \
+  --sid group-a \
+  --sid-token token-a \
+  --tls-cert-path ./certs/node-a.crt \
+  --tls-key-path ./certs/node-a.key \
+  --tls-ca-path ./certs/ca.crt
 ```
 
 # EXIT STATUS

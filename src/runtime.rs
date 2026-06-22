@@ -3,14 +3,20 @@ use crate::config::AppConfig;
 use crate::discovery::{DiscoveryEngine, DiscoveryEvent};
 use crate::ssh_keys::read_local_public_key;
 use crate::transport::{HttpKeyExchangeService, PATH_GET_PUBLIC_KEY, PATH_PUBLISH_PARTICIPANT};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{
+    ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
+};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
+use std::io::BufReader;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,6 +47,8 @@ pub enum RuntimeError {
     RuntimeDirectory(String),
     MissingHomeDir,
     KillProcess(u32),
+    MissingTlsConfig(&'static str),
+    InvalidTlsConfig(String),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -70,6 +78,12 @@ impl std::fmt::Display for RuntimeError {
             RuntimeError::KillProcess(pid) => {
                 write!(f, "Failed to terminate process with pid {pid}")
             }
+            RuntimeError::MissingTlsConfig(name) => {
+                write!(f, "Missing TLS configuration value: {name}")
+            }
+            RuntimeError::InvalidTlsConfig(message) => {
+                write!(f, "Invalid TLS configuration: {message}")
+            }
         }
     }
 }
@@ -81,6 +95,16 @@ struct PeerEndpoint {
     participant_id: String,
     address: String,
     port: u16,
+}
+
+#[derive(Clone)]
+enum TransportSecurity {
+    Tls {
+        server: Arc<ServerConfig>,
+        client: Arc<ClientConfig>,
+        server_name_override: Option<String>,
+    },
+    InsecureNoTls,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +126,7 @@ pub fn run_daemon(config: &AppConfig) -> Result<(), RuntimeError> {
         local_public_key.clone(),
     )
     .map_err(|_| RuntimeError::ReadLocalPublicKey(public_key_path.clone()))?;
+    let transport_security = build_transport_security(config)?;
 
     let http_listener = TcpListener::bind(&config.http_listen_addr)
         .map_err(|_| RuntimeError::BindHttp(config.http_listen_addr.clone()))?;
@@ -147,6 +172,9 @@ pub fn run_daemon(config: &AppConfig) -> Result<(), RuntimeError> {
         "Daemon is running. HTTP: {}, UDP: {}, participant: {}",
         config.http_listen_addr, config.udp_announce_addr, config.participant_id
     );
+    if matches!(transport_security, TransportSecurity::InsecureNoTls) {
+        println!("WARNING: transport security is disabled (--insecure-no-tls)");
+    }
 
     send_announcement(
         &udp_socket,
@@ -159,14 +187,22 @@ pub fn run_daemon(config: &AppConfig) -> Result<(), RuntimeError> {
     )?;
 
     loop {
-        handle_http_connections(&http_listener, &service);
+        handle_http_connections(&http_listener, &service, &transport_security);
         handle_udp_announcements(&udp_socket, &mut discovery);
 
         let now = now_secs();
         let sync_due = now >= next_sync_at;
         let discovery_trigger = discovery.take_sync_trigger();
         if sync_due || discovery_trigger {
-            if run_sync_cycle(config, &service, &discovery, &mut managed_keys).is_ok() {
+            if run_sync_cycle(
+                config,
+                &service,
+                &discovery,
+                &transport_security,
+                &mut managed_keys,
+            )
+            .is_ok()
+            {
                 if !config.dry_run {
                     let keys: Vec<String> = managed_keys.values().cloned().collect();
                     apply_managed_block_to_file(&authorized_keys_path, &keys).map_err(|_| {
@@ -215,6 +251,10 @@ pub fn run_single_sync(config: &AppConfig) -> Result<(), RuntimeError> {
         local_public_key,
     )
     .map_err(|_| RuntimeError::ReadLocalPublicKey(public_key_path.clone()))?;
+    let transport_security = build_transport_security(config)?;
+    if matches!(transport_security, TransportSecurity::InsecureNoTls) {
+        println!("WARNING: transport security is disabled (--insecure-no-tls)");
+    }
     let mut discovery = DiscoveryEngine::new(
         config.sid.clone(),
         config.sid_token.clone(),
@@ -224,7 +264,13 @@ pub fn run_single_sync(config: &AppConfig) -> Result<(), RuntimeError> {
     discovery.add_bootstrap_peers(&config.bootstrap_peers);
     let mut managed_keys: HashMap<String, String> = HashMap::new();
 
-    run_sync_cycle(config, &service, &discovery, &mut managed_keys)?;
+    run_sync_cycle(
+        config,
+        &service,
+        &discovery,
+        &transport_security,
+        &mut managed_keys,
+    )?;
     if !config.dry_run {
         let keys: Vec<String> = managed_keys.values().cloned().collect();
         apply_managed_block_to_file(&authorized_keys_path, &keys)
@@ -299,6 +345,7 @@ fn run_sync_cycle(
     config: &AppConfig,
     service: &HttpKeyExchangeService,
     discovery: &DiscoveryEngine,
+    transport_security: &TransportSecurity,
     managed_keys: &mut HashMap<String, String>,
 ) -> Result<(), RuntimeError> {
     let mut endpoints: HashMap<String, PeerEndpoint> = HashMap::new();
@@ -322,7 +369,7 @@ fn run_sync_cycle(
         if endpoint.participant_id == config.participant_id {
             continue;
         }
-        if let Ok(key) = request_public_key(service, endpoint) {
+        if let Ok(key) = request_public_key(service, endpoint, transport_security) {
             managed_keys.insert(endpoint.participant_id.clone(), key);
         }
     }
@@ -333,6 +380,7 @@ fn run_sync_cycle(
 fn request_public_key(
     service: &HttpKeyExchangeService,
     endpoint: &PeerEndpoint,
+    transport_security: &TransportSecurity,
 ) -> Result<String, RuntimeError> {
     let request_envelope =
         service.build_get_public_key_request(&endpoint.participant_id, now_secs(), &next_nonce());
@@ -342,6 +390,7 @@ fn request_public_key(
         endpoint.port,
         PATH_GET_PUBLIC_KEY,
         &request_body,
+        transport_security,
     )
     .map_err(|_| RuntimeError::HttpRequest)?;
     let response_envelope =
@@ -352,13 +401,28 @@ fn request_public_key(
     Ok(payload.public_key)
 }
 
-fn handle_http_connections(listener: &TcpListener, service: &HttpKeyExchangeService) {
+fn handle_http_connections(
+    listener: &TcpListener,
+    service: &HttpKeyExchangeService,
+    transport_security: &TransportSecurity,
+) {
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(IO_TIMEOUT_SECS)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(IO_TIMEOUT_SECS)));
-                let _ = handle_http_connection(&mut stream, service);
+                match transport_security {
+                    TransportSecurity::InsecureNoTls => {
+                        let _ = handle_http_connection(&mut stream, service);
+                    }
+                    TransportSecurity::Tls { server, .. } => {
+                        let connection = ServerConnection::new(server.clone());
+                        if let Ok(connection) = connection {
+                            let mut tls_stream = StreamOwned::new(connection, stream);
+                            let _ = handle_http_connection(&mut tls_stream, service);
+                        }
+                    }
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => break,
@@ -366,8 +430,8 @@ fn handle_http_connections(listener: &TcpListener, service: &HttpKeyExchangeServ
     }
 }
 
-fn handle_http_connection(
-    stream: &mut TcpStream,
+fn handle_http_connection<S: Read + Write>(
+    stream: &mut S,
     service: &HttpKeyExchangeService,
 ) -> Result<(), std::io::Error> {
     let (path, body) = read_http_request(stream)?;
@@ -474,7 +538,7 @@ fn parse_bootstrap_peer(value: &str) -> Option<PeerEndpoint> {
     })
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<(String, String), std::io::Error> {
+fn read_http_request<S: Read>(stream: &mut S) -> Result<(String, String), std::io::Error> {
     let mut data = Vec::new();
     let mut chunk = [0_u8; 1024];
     let header_end;
@@ -541,8 +605,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<(String, String), std::io
     Ok((path, body))
 }
 
-fn write_http_response(
-    stream: &mut TcpStream,
+fn write_http_response<S: Write>(
+    stream: &mut S,
     status_code: u16,
     body: &[u8],
 ) -> Result<(), std::io::Error> {
@@ -568,6 +632,7 @@ fn send_http_post(
     port: u16,
     path: &str,
     body: &str,
+    transport_security: &TransportSecurity,
 ) -> Result<String, std::io::Error> {
     let socket = resolve_socket_addr(address, port)?;
     let mut stream = TcpStream::connect_timeout(&socket, Duration::from_secs(IO_TIMEOUT_SECS))?;
@@ -579,11 +644,27 @@ fn send_http_post(
         body.len(),
         body
     );
-    stream.write_all(request.as_bytes())?;
-    stream.flush()?;
-
     let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    match transport_security {
+        TransportSecurity::InsecureNoTls => {
+            stream.write_all(request.as_bytes())?;
+            stream.flush()?;
+            stream.read_to_end(&mut response)?;
+        }
+        TransportSecurity::Tls {
+            client,
+            server_name_override,
+            ..
+        } => {
+            let server_name = resolve_tls_server_name(address, server_name_override)?;
+            let connection = ClientConnection::new(client.clone(), server_name)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let mut tls_stream = StreamOwned::new(connection, stream);
+            tls_stream.write_all(request.as_bytes())?;
+            tls_stream.flush()?;
+            tls_stream.read_to_end(&mut response)?;
+        }
+    }
     let header_end = find_subslice(&response, b"\r\n\r\n")
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid response"))?
         + 4;
@@ -596,6 +677,92 @@ fn resolve_socket_addr(address: &str, port: u16) -> Result<SocketAddr, std::io::
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address"))
+}
+
+fn build_transport_security(config: &AppConfig) -> Result<TransportSecurity, RuntimeError> {
+    if config.insecure_no_tls {
+        return Ok(TransportSecurity::InsecureNoTls);
+    }
+
+    let cert_path = expand_home_path(
+        config
+            .tls_cert_path
+            .as_deref()
+            .ok_or(RuntimeError::MissingTlsConfig("--tls-cert-path"))?,
+    );
+    let key_path = expand_home_path(
+        config
+            .tls_key_path
+            .as_deref()
+            .ok_or(RuntimeError::MissingTlsConfig("--tls-key-path"))?,
+    );
+    let ca_path = expand_home_path(
+        config
+            .tls_ca_path
+            .as_deref()
+            .ok_or(RuntimeError::MissingTlsConfig("--tls-ca-path"))?,
+    );
+
+    let certs = load_cert_chain(&cert_path)?;
+    let key = load_private_key(&key_path)?;
+    let server = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| RuntimeError::InvalidTlsConfig(e.to_string()))?;
+
+    let ca_certs = load_cert_chain(&ca_path)?;
+    let mut roots = RootCertStore::empty();
+    let (added, _ignored) = roots.add_parsable_certificates(ca_certs);
+    if added == 0 {
+        return Err(RuntimeError::InvalidTlsConfig(format!(
+            "no valid CA certificates in {ca_path}"
+        )));
+    }
+    let client = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    Ok(TransportSecurity::Tls {
+        server: Arc::new(server),
+        client: Arc::new(client),
+        server_name_override: config.tls_server_name.clone(),
+    })
+}
+
+fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>, RuntimeError> {
+    let file = File::open(path).map_err(|_| RuntimeError::InvalidTlsConfig(path.to_owned()))?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| RuntimeError::InvalidTlsConfig(e.to_string()))?;
+    if certs.is_empty() {
+        return Err(RuntimeError::InvalidTlsConfig(format!(
+            "no certificates in {path}"
+        )));
+    }
+    Ok(certs)
+}
+
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, RuntimeError> {
+    let file = File::open(path).map_err(|_| RuntimeError::InvalidTlsConfig(path.to_owned()))?;
+    let mut reader = BufReader::new(file);
+    let key = rustls_pemfile::private_key(&mut reader)
+        .map_err(|e| RuntimeError::InvalidTlsConfig(e.to_string()))?
+        .ok_or_else(|| RuntimeError::InvalidTlsConfig(format!("no private key in {path}")))?;
+    Ok(key)
+}
+
+fn resolve_tls_server_name(
+    address: &str,
+    override_name: &Option<String>,
+) -> Result<ServerName<'static>, std::io::Error> {
+    let value = override_name.as_deref().unwrap_or(address).trim();
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+    ServerName::try_from(value.to_owned()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid tls server name")
+    })
 }
 
 fn serialize_envelope(envelope: &crate::auth::SignedEnvelope) -> String {

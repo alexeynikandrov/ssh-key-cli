@@ -65,6 +65,26 @@ struct SyncConfigArgs {
     #[arg(long)]
     authorized_keys_path: Option<String>,
 
+    /// Path to TLS certificate (PEM). Required unless --insecure-no-tls is set.
+    #[arg(long)]
+    tls_cert_path: Option<String>,
+
+    /// Path to TLS private key (PEM). Required unless --insecure-no-tls is set.
+    #[arg(long)]
+    tls_key_path: Option<String>,
+
+    /// Path to TLS CA certificate bundle (PEM). Required unless --insecure-no-tls is set.
+    #[arg(long)]
+    tls_ca_path: Option<String>,
+
+    /// Override TLS server name for outbound certificate validation.
+    #[arg(long)]
+    tls_server_name: Option<String>,
+
+    /// Disable TLS (dev/test only). Not recommended for production.
+    #[arg(long, default_value_t = false)]
+    insecure_no_tls: bool,
+
     /// Dry-run mode without writing changes.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -235,6 +255,11 @@ fn config_input_from_args(args: &SyncConfigArgs) -> ConfigInput<'_> {
         sync_interval_secs: args.sync_interval_secs,
         public_key_path: args.public_key_path.as_deref(),
         authorized_keys_path: args.authorized_keys_path.as_deref(),
+        tls_cert_path: args.tls_cert_path.as_deref(),
+        tls_key_path: args.tls_key_path.as_deref(),
+        tls_ca_path: args.tls_ca_path.as_deref(),
+        tls_server_name: args.tls_server_name.as_deref(),
+        insecure_no_tls: args.insecure_no_tls,
         dry_run: args.dry_run,
         config_path: args.config_path.as_deref(),
     }
