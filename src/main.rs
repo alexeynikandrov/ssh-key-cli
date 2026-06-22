@@ -17,7 +17,6 @@ mod transport;
 
 use clap::{Parser, Subcommand};
 use config::{ConfigInput, ConfigMode, load_config};
-use std::fs::OpenOptions;
 use std::process::{Command as ProcessCommand, Stdio};
 
 #[derive(Parser, Debug)]
@@ -106,14 +105,18 @@ fn main() {
                 }
             },
             Command::Status => match runtime::status_daemon(&sid) {
-                runtime::DaemonStatus::Running { pid } => {
+                Ok(runtime::DaemonStatus::Running { pid }) => {
                     println!("Daemon is running for SID: {sid} (pid: {pid})");
                 }
-                runtime::DaemonStatus::Stopped => {
+                Ok(runtime::DaemonStatus::Stopped) => {
                     println!("Daemon is stopped for SID: {sid}");
                 }
-                runtime::DaemonStatus::StalePidFile { pid } => {
+                Ok(runtime::DaemonStatus::StalePidFile { pid }) => {
                     println!("Daemon is stopped for SID: {sid} (stale pid file: {pid})");
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
                 }
             },
             _ => {}
@@ -152,20 +155,27 @@ fn main() {
         Command::Start => {
             let config = config.expect("required configuration is missing");
             if !cli.foreground && std::env::var("SSH_KEY_SYNC_INTERNAL_FOREGROUND").is_err() {
-                if let runtime::DaemonStatus::Running { pid } = runtime::status_daemon(&config.sid)
-                {
-                    println!(
-                        "Daemon is already running for SID: {} (pid: {pid})",
-                        config.sid
-                    );
-                    return;
-                }
-                match spawn_background_start() {
-                    Ok(()) => {
+                match runtime::status_daemon(&config.sid) {
+                    Ok(runtime::DaemonStatus::Running { pid }) => {
                         println!(
-                            "Daemon started in background for SID: {} (log: {})",
-                            config.sid,
-                            log_file_path(&config.sid)
+                            "Daemon is already running for SID: {} (pid: {pid})",
+                            config.sid
+                        );
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("{error}");
+                        std::process::exit(1);
+                    }
+                }
+                match spawn_background_start(&config.sid) {
+                    Ok(()) => {
+                        let log_path = runtime::daemon_log_file_path(&config.sid)
+                            .unwrap_or_else(|_| "<unavailable>".to_owned());
+                        println!(
+                            "Daemon started in background for SID: {} (log: {log_path})",
+                            config.sid
                         );
                         return;
                     }
@@ -198,16 +208,10 @@ fn resolve_sid(cli: &Cli) -> Option<String> {
         .or_else(|| std::env::var("SSH_KEY_SYNC_SID").ok())
 }
 
-fn spawn_background_start() -> Result<(), String> {
+fn spawn_background_start(sid: &str) -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let sid = sid_from_args_or_env().unwrap_or_else(|| "default".to_owned());
-    let log_path = log_file_path(&sid);
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|error| error.to_string())?;
+    let (log_file, _) = runtime::open_daemon_log_file(sid).map_err(|error| error.to_string())?;
     let log_err = log_file.try_clone().map_err(|error| error.to_string())?;
 
     ProcessCommand::new(executable)
@@ -220,31 +224,4 @@ fn spawn_background_start() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     Ok(())
-}
-
-fn sid_from_args_or_env() -> Option<String> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--sid" {
-            return args.next();
-        }
-    }
-    std::env::var("SSH_KEY_SYNC_SID").ok()
-}
-
-fn log_file_path(sid: &str) -> String {
-    format!("/tmp/ssh-key-sync-{}.log", sanitize_for_file(sid))
-}
-
-fn sanitize_for_file(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
