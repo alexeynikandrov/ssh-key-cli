@@ -1,4 +1,4 @@
-% SSH-KEY-SYNC(1) ssh-key-sync 0.1.14
+% SSH-KEY-SYNC(1) ssh-key-sync 0.1.15
 % ssh-key-sync maintainers
 % June 2026
 

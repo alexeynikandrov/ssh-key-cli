@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.15] - 2026-06-22
+
+### Changed
+- Updated CI workflow to install `pandoc` on `ubuntu-latest` before `make release`.
+- Fixed CI failure on manpage generation step (`pandoc: No such file or directory`).
+
 ## [0.1.14] - 2026-06-22
 
 ### Changed

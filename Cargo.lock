@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-key-sync"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "clap",
  "hmac",
