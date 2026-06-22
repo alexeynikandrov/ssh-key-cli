@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.13] - 2026-06-22
+
+### Added
+- Added RFC-0002 and plan `docs/PLAN-2-2.md` for phased weaknesses remediation.
+- Added runtime tests for daemon control path resolution and private permission enforcement.
+
+### Changed
+- Moved daemon control artifacts from `/tmp` to
+  `${XDG_RUNTIME_DIR}/ssh-key-sync/<sid>/` with fallback to
+  `~/.local/run/ssh-key-sync/<sid>/`.
+- Switched control file names to `daemon.pid`, `daemon.stop`, and `daemon.log`.
+- Enforced private Unix permissions for daemon control artifacts (`0700` directories, `0600` files).
+- Updated daemon status/control flows to surface control-path errors explicitly.
+- Updated `docs/man.md` with the new daemon runtime file locations.
+
 ## [0.1.12] - 2026-06-18
 
 ### Added
